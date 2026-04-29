@@ -1,0 +1,132 @@
+# docker-compose.postgres.yml — Postgres-backend stack overlay.
+#
+# Drop-in companion to docker-compose.yml. The mongo / documentdb service
+# blocks remain untouched in the upstream file; this overlay adds the
+# pgvector-backed Postgres database and a registry build that uses it.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+#       --profile postgres up -d postgres
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+#       --profile postgres run --rm registry-postgres alembic upgrade head
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+#       --profile postgres up -d registry-postgres
+#
+# Profile `postgres` is mandatory — without `--profile postgres` neither
+# service starts, so existing mongo workflows are unaffected.
+
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mcp-postgres
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE:-mcp_registry}
+      POSTGRES_USER: ${POSTGRES_USERNAME:-mcp_registry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # shared_preload_libraries is required for pg_stat_statements (see
+      # migrations/postgres/000-prelude.sql §1).
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements,pg_cron"
+      - "-c"
+      - "cron.database_name=${POSTGRES_DATABASE:-mcp_registry}"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME:-mcp_registry} -d ${POSTGRES_DATABASE:-mcp_registry}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # Registry image built from Dockerfile.postgres-backend.
+  # Inherits the same environment surface as the upstream `registry` service
+  # in docker-compose.yml; only the build target and Postgres-specific env
+  # vars differ. Run `--profile postgres up -d` to enable.
+  registry-postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-backend
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-1.0.0}
+    container_name: mcp-registry-postgres
+    profiles: ["postgres"]
+    environment:
+      # --- Storage backend selection ---
+      STORAGE_BACKEND: postgres
+      # --- Postgres connection (required) ---
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USERNAME:-mcp_registry}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DATABASE:-mcp_registry}}
+      POSTGRES_NAMESPACE: ${POSTGRES_NAMESPACE:-default}
+      POSTGRES_SSL_MODE: ${POSTGRES_SSL_MODE:-disable}
+      POSTGRES_SSL_CA_FILE: ${POSTGRES_SSL_CA_FILE:-}
+      POSTGRES_POOL_MIN: ${POSTGRES_POOL_MIN:-2}
+      POSTGRES_POOL_MAX: ${POSTGRES_POOL_MAX:-20}
+      POSTGRES_STATEMENT_TIMEOUT_MS: ${POSTGRES_STATEMENT_TIMEOUT_MS:-30000}
+      POSTGRES_COMMAND_TIMEOUT_S: ${POSTGRES_COMMAND_TIMEOUT_S:-60}
+      # --- Embeddings (drives the embeddings table dimension N) ---
+      EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-sentence-transformers}
+      EMBEDDINGS_MODEL_NAME: ${EMBEDDINGS_MODEL_NAME:-all-MiniLM-L6-v2}
+      EMBEDDINGS_MODEL_DIMENSIONS: ${EMBEDDINGS_MODEL_DIMENSIONS:-384}
+      # --- vector search tuning (per-query SET LOCAL hnsw.ef_search) ---
+      VECTOR_SEARCH_EF_SEARCH: ${VECTOR_SEARCH_EF_SEARCH:-100}
+      # --- Inherited from upstream registry — only the keys that matter for
+      # backend selection are overridden above; the rest pass through env. ---
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-with-gateway}
+      REGISTRY_MODE: ${REGISTRY_MODE:-full}
+      SECRET_KEY: ${SECRET_KEY}
+      AUTH_SERVER_URL: ${AUTH_SERVER_URL}
+      AUTH_SERVER_EXTERNAL_URL: ${AUTH_SERVER_EXTERNAL_URL}
+      METRICS_SERVICE_URL: http://metrics-service:8890
+      METRICS_API_KEY: ${METRICS_API_KEY_REGISTRY}
+      METRICS_API_KEY_NGINX: ${METRICS_API_KEY_REGISTRY}
+      AUTH_PROVIDER: ${AUTH_PROVIDER:-cognito}
+    ports:
+      - "${REGISTRY_HTTP_PORT:-80}:8080"
+      - "${REGISTRY_HTTPS_PORT:-443}:8443"
+      - "7860:7860"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ${HOME}/mcp-gateway/servers:/app/registry/servers
+      - ${HOME}/mcp-gateway/agents:/app/registry/agents
+      - ${HOME}/mcp-gateway/models:/app/registry/models
+      - ${HOME}/mcp-gateway/auth_server/scopes.yml:/app/auth_server/scopes.yml
+      - ${HOME}/mcp-gateway/federation.json:/app/config/federation.json
+      - ${HOME}/mcp-gateway/ssl:/etc/ssl:ro
+      - registry-postgres-logs:/app/logs
+      - registry-postgres-scans:/app/security_scans
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-server:
+        condition: service_started
+      metrics-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  registry-postgres-logs:
+  registry-postgres-scans:
