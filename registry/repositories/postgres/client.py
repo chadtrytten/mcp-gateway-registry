@@ -205,6 +205,12 @@ def _table(base_name: str) -> str:
     return f"{base_name}_{settings.postgres_namespace}"
 
 
+# Public alias used by repository modules (POSTGRES-D pattern).
+# Tests monkeypatch this name on each repository module.
+def table_name(base_name: str) -> str:
+    return _table(base_name)
+
+
 # ---------------------------------------------------------------------------
 # Retry policy — memo §7
 # ---------------------------------------------------------------------------
@@ -319,6 +325,7 @@ __all__ = [
     "close_pool",
     "acquire",
     "_table",
+    "table_name",
     "postgres_retry",
     "health_check",
     "advisory_lock",
